@@ -67,36 +67,30 @@ class ComBadgeServerRXOp(Operator):
         finally:
             if self.server_socket:
                 self.server_socket.close()
-    
-
 
 class AudioQueue:
-    """
-    Implement same context manager/iterator interfaces as MicrophoneStream (for ASR.process_audio())
-    Credit for this code: https://github.com/dusty-nv/jetson-containers/blob/master/packages/llm/llamaspeak/asr.py
-    """
-    def __init__(self, audio_chunk=1024):
+    def __init__(self):
         self.queue = Queue()
-        self.audio_chunk = audio_chunk
+        self.size = 0
 
     def put(self, samples):
         self.queue.put(samples)
+        self.size += len(samples)
         
+    def get_all(self) -> bytes:
+        data = []
+        
+        while not self.queue.empty():
+            data.append(self.queue.get())
+            self.size -= len(data[-1])
+
+        return b''.join(data)
+
     def __enter__(self):
         return self
         
     def __exit__(self, type, value, traceback):
         pass
-        
-    def __next__(self) -> bytes:
-        data = []
-        size = 0
-        
-        while size <= self.audio_chunk * 2:
-            data.append(self.queue.get())
-            size += len(data[-1])
-
-        return b''.join(data)
     
     def __iter__(self):
         return self
@@ -107,27 +101,12 @@ class ClientHandler(Thread):
         self.client_socket = conn
         self.client_address = addr
         self.op_output = op_output
+        self.wavHeader = wavHeader()
         self.audio_queue = AudioQueue()
-        self.end_of_audio = "END_OF_AUDIO"
+        self.end_of_audio = bytes("END_OF_AUDIO", 'utf-8')
         self.daemon = True # Allow thread to be killed when the main program exists
         self.start()
-
-        # audio variables
-        self.wavHeader = wavHeader()
-
-
-        self.is_speaking = False
-        self.audio_bytes = bytes()
-        self.done_speaking = False # used to determine if the transcript should be sent as complete
-        self.sample_rate_hz = cli_args.sample_rate_hz
-        self.whisper_response = ""
-        self.whisper_pipeline = self._get_whisper_pipeline()
-
-        # queue used to write ASR responses to in a background thread
-        self.streaming_queue = Queue()
-        
-        # flag that gives Riva time to output final prediction
-        self.input_queue = AudioQueue()
+        # self.sample_rate_hz = cli_args.sample_rate_hz
         
     def run(self):
         print(f'Connected by {self.client_address}')
@@ -150,58 +129,30 @@ class ClientHandler(Thread):
             # Receive audio data
             while True:
                 audio_bytes = self.client_socket.recv(1024)
-                if not data:
+                if not audio_bytes:
                     break
                 
                 print(f'{len(audio_bytes)} data samples received from {self.client_address}') # : {message.strip()}
                 
                 # compare data to end_of_audio
                 if (self.end_of_audio in audio_bytes):
-                    bit_str = queue_data
+                    byte_str = self.audio_queue.get_all()
                     server_rx_response = {
-                        "data": bit_str,
+                        "data": byte_str,
                         "client-ip": self.client_address,
                     }
                     self.op_output.emit(server_rx_response, "server_rx_response")
-                    # clear queue
                     # make sure queue is empty
-
+                    if (self.audio_queue.size != 0):
+                        print("Error getting audio data from queue")
+                
                 # add data to queue
                 else:
                     self.audio_queue.put(audio_bytes)
 
-                
         except Exception as e:
             print(f"Error handling client {self.client_address}: {e}")
         
         finally:
             print(f'Lost connection from {self.client_address}')
             self.client_socket.close()
-
-
-
-
-
-        if not self.streaming_queue.empty():
-            # Gather Riva responses
-            riva_response = self.streaming_queue.get(True, 0.1)
-        else:
-            # Sleep if no response, otherwise the app is unable to handle the
-            # rate of compute() calls
-            sleep(0.05)
-            riva_response = None
-
-        whisper_response = self.whisper_response
-        if whisper_response:
-            self.done_speaking = True
-            self.whisper_response = ""
- 
-        asr_response = {
-            "is_speaking": self.is_speaking,
-            "done_speaking": self.done_speaking,
-            "riva_response": riva_response,
-            "whisper_response": whisper_response
-        }
-        op_output.emit(asr_response, "asr_response")
-        # Reset done_speaking flag
-        self.done_speaking = False
